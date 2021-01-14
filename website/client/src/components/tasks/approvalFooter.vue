@@ -11,7 +11,17 @@
         v-html="message"
       ></div>
       <div
-        v-if="!userIsAssigned && !task.completed"
+        v-if="userIsManager && task.group.assignedUsers.length === 1"
+        class="ml-auto mr-2"
+      >
+        <a
+          class="unclaim-color"
+          @click="unassign()"
+        >{{ $t('unassign') }}</a>
+      </div>
+      <div
+        v-if="task.group.claimable && !task.completed
+          && !task.group.claimedUser && task.group.assignedUsers.length === 0"
         class="ml-auto mr-2"
       >
         <a
@@ -20,12 +30,13 @@
         >{{ $t('claim') }}</a>
       </div>
       <div
-        v-if="userIsAssigned && !approvalRequested && !task.completed"
+        v-if="(userHasClaimed || userIsManager)
+          && task.group.claimedUser && !approvalRequested && !task.completed"
         class="ml-auto mr-2"
       >
         <a
           class="unclaim-color"
-          @click="unassign()"
+          @click="unclaim()"
         >{{ $t('removeClaim') }}</a>
       </div>
     </div>
@@ -100,12 +111,20 @@ export default {
       return this.task.group.assignedUsers
         && this.task.group.assignedUsers.indexOf(this.user._id) !== -1;
     },
+    userHasClaimed () {
+      return this.task.group.claimedUser
+        && this.task.group.claimedUser === this.user._id;
+    },
     message () {
-      const { assignedUsers } = this.task.group;
-      const assignedUsersNames = [];
+      const { assignedUsers, claimable, claimedUser } = this.task.group;
       const assignedUsersLength = assignedUsers.length;
 
-      // @TODO: Eh, I think we only ever display one user name
+      if (assignedUsers.length === 0 && claimable && !claimedUser) {
+        return this.$t('taskIsUnclaimed');
+      }
+      if (this.userHasClaimed) return this.$t('youClaimedTask');
+
+      const assignedUsersNames = [];
       if (this.group && this.group.members) {
         assignedUsers.forEach(userId => {
           const index = findIndex(this.group.members, member => member._id === userId);
@@ -126,10 +145,9 @@ export default {
       return this.$t('taskIsUnassigned');
     },
     userIsManager () {
-      if (
-        this.group
-        && (this.group.leader.id === this.user._id || this.group.managers[this.user._id])
-      ) return true;
+      if (!this.group) return false;
+      if (!this.group.leader && !this.group.managers) return false;
+      if (this.group.leader.id === this.user._id || this.group.managers[this.user._id]) return true;
       return false;
     },
     approvalRequested () {
@@ -154,17 +172,24 @@ export default {
         taskId = this.task.group.taskId;
       }
 
-      await this.$store.dispatch('tasks:assignTask', {
-        taskId,
-        userId: this.user._id,
-      });
-      this.task.group.assignedUsers.push(this.user._id);
+      await this.$store.dispatch('tasks:claimTask', { taskId });
+      this.task.group.claimedUser = this.user._id;
       this.sync();
     },
-    async unassign () {
-      if (!window.confirm(this.$t('confirmUnClaim'))) return; // eslint-disable-line no-alert
-
+    async unclaim () {
       let taskId = this.task._id;
+      // If we are on the user task
+      if (this.task.userId) {
+        taskId = this.task.group.taskId;
+      }
+
+      await this.$store.dispatch('tasks:unclaimTask', { taskId });
+      this.task.group.claimedUser = null;
+      this.sync();
+    },
+    async unassign () { // Only available if there is just a single assigned user
+      let taskId = this.task._id;
+      const userId = this.task.group.assignedUsers[0];
       // If we are on the user task
       if (this.task.userId) {
         taskId = this.task.group.taskId;
@@ -172,9 +197,9 @@ export default {
 
       await this.$store.dispatch('tasks:unassignTask', {
         taskId,
-        userId: this.user._id,
+        userId,
       });
-      const index = this.task.group.assignedUsers.indexOf(this.user._id);
+      const index = this.task.group.assignedUsers.indexOf(userId);
       this.task.group.assignedUsers.splice(index, 1);
 
       this.sync();
@@ -191,7 +216,6 @@ export default {
       this.sync();
     },
     needsWork () {
-      if (!window.confirm(this.$t('confirmNeedsWork'))) return; // eslint-disable-line no-alert
       const userIdNeedsMoreWork = this.task.group.assignedUsers[0];
       this.$store.dispatch('tasks:needsWork', {
         taskId: this.task._id,

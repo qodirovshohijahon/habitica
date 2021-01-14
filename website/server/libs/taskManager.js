@@ -111,7 +111,12 @@ export async function createTasks (req, res, options = {}) {
       if (taskData.requiresApproval) {
         newTask.group.approval.required = true;
       }
-      newTask.group.sharedCompletion = taskData.sharedCompletion || SHARED_COMPLETION.default;
+      if (taskData.claimable) {
+        newTask.group.claimable = true;
+      }
+      if (taskType === 'todo') {
+        newTask.group.sharedCompletion = taskData.sharedCompletion || SHARED_COMPLETION.single;
+      }
       newTask.group.managerNotes = taskData.managerNotes || '';
     } else {
       newTask.userId = user._id;
@@ -371,6 +376,24 @@ async function scoreTask (user, task, direction, req, res) {
     }
   }
 
+  let localTask;
+
+  if (task.group.id && !task.userId) { // Task is being scored from team board
+    if (task.group.claimable && task.group.claimedUser !== user._id) {
+      throw new BadRequest('Task must be claimed before scoring.');
+    }
+    if (task.group.assignedUsers.length > 0 && !task.group.assignedUsers.includes(user._id)) {
+      throw new BadRequest('Task has not been assigned to this user.');
+    }
+    if (task.group.claimable || task.group.assignedUsers.length > 0) {
+    // Task has been copied to user's list, need to find that task for later update
+      localTask = await Tasks.Task.findOne(
+        { userId: user._id, 'group.taskId': task._id },
+      ).exec();
+      if (!localTask) throw new NotFound('Task not found.');
+    }
+  }
+
   if (task.group.approval.required && !task.group.approval.approved) {
     const fields = requiredGroupFields.concat(' managers');
     const group = await Group.getGroup({ user, groupId: task.group.id, fields });
@@ -393,6 +416,9 @@ async function scoreTask (user, task, direction, req, res) {
 
       task.group.approval.requested = true;
       task.group.approval.requestedDate = new Date();
+      if (task.group.approval.requestingUsers.indexOf(user._id) === -1) {
+        task.group.approval.requestingUsers.push(user._id);
+      }
 
       const managers = await User.find({ _id: managerIds }, 'notifications preferences').exec(); // Use this method so we can get access to notifications
 
@@ -446,25 +472,31 @@ async function scoreTask (user, task, direction, req, res) {
 
   // If a todo was completed or uncompleted move it in or out of the user.tasksOrder.todos list
   // TODO move to common code?
-  let pullTask = false;
-  let pushTask = false;
+  let pullTask;
+  let pushTask;
   if (task.type === 'todo') {
     if (!wasCompleted && task.completed) {
       // @TODO: mongoose's push and pull should be atomic and help with
       // our concurrency issues. If not, we need to use this update $pull and $push
-      pullTask = true;
+      pullTask = localTask ? localTask._id : task._id;
       // user.tasksOrder.todos.pull(task._id);
     } else if (
       wasCompleted
       && !task.completed
       && user.tasksOrder.todos.indexOf(task._id) === -1
     ) {
-      pushTask = true;
+      pushTask = localTask ? localTask._id : task._id;
       // user.tasksOrder.todos.push(task._id);
     }
   }
 
   setNextDue(task, user);
+
+  if (localTask) {
+    localTask.completed = task.completed;
+    localTask.value = task.value + delta;
+    await localTask.save();
+  }
 
   taskScoredWebhook.send(user, {
     task,
@@ -561,8 +593,8 @@ export async function scoreTasks (user, taskScorings, req, res) {
   const pushIDs = [];
 
   returnDatas.forEach(returnData => {
-    if (returnData.pushTask === true) pushIDs.push(returnData.task._id);
-    if (returnData.pullTask === true) pullIDs.push(returnData.task._id);
+    if (returnData.pushTask) pushIDs.push(returnData.pushTask);
+    if (returnData.pullTask) pullIDs.push(returnData.pullTask);
   });
 
   const moveUpdateObject = {};

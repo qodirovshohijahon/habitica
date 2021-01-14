@@ -30,6 +30,7 @@ import baseModel from '../libs/baseModel';
 import { sendTxn as sendTxnEmail } from '../libs/email'; // eslint-disable-line import/no-cycle
 import { sendNotification as sendPushNotification } from '../libs/pushNotifications'; // eslint-disable-line import/no-cycle
 import { // eslint-disable-line import/no-cycle
+  setNextDue,
   syncableAttrs,
 } from '../libs/taskManager';
 import {
@@ -1382,7 +1383,10 @@ schema.methods.leave = async function leaveGroup (user, keep = 'keep-all', keepC
   const assignedTasks = await Tasks.Task.find({
     'group.id': group._id,
     userId: { $exists: false },
-    'group.assignedUsers': user._id,
+    $or: [
+      { 'group.assignedUsers': user._id },
+      { 'group.claimedUser': user._id },
+    ],
   }).exec();
   const assignedTasksToRemoveUserFrom = assignedTasks
     .map(task => this.unlinkTask(task, user, keep, false));
@@ -1473,8 +1477,9 @@ schema.methods.updateTask = async function updateTask (taskToSync, options = {})
 
   updateCmd.$set['group.approval.required'] = taskToSync.group.approval.required;
   updateCmd.$set['group.assignedUsers'] = taskToSync.group.assignedUsers;
-  updateCmd.$set['group.sharedCompletion'] = taskToSync.group.sharedCompletion;
+  updateCmd.$set['group.claimable'] = taskToSync.group.claimable;
   updateCmd.$set['group.managerNotes'] = taskToSync.group.managerNotes;
+  updateCmd.$set['group.sharedCompletion'] = taskToSync.group.sharedCompletion;
 
   const taskSchema = Tasks[taskToSync.type];
 
@@ -1508,8 +1513,16 @@ schema.methods.syncTask = async function groupSyncTask (taskToSync, user, assign
   const group = this;
   const toSave = [];
 
-  if (taskToSync.group.assignedUsers.indexOf(user._id) === -1) {
-    taskToSync.group.assignedUsers.push(user._id);
+  if (assigningUser) {
+    if (taskToSync.group.assignedUsers.indexOf(user._id) === -1) {
+      taskToSync.group.assignedUsers.push(user._id);
+    }
+    taskToSync.group.claimable = false;
+    if (taskToSync.claimedUser) {
+      await group.unlinkTask(taskToSync, user);
+    }
+  } else {
+    taskToSync.group.claimedUser = user._id;
   }
 
   // Sync tags
@@ -1543,7 +1556,11 @@ schema.methods.syncTask = async function groupSyncTask (taskToSync, user, assign
     matchingTask.group.id = taskToSync.group.id;
     matchingTask.userId = user._id;
     matchingTask.group.taskId = taskToSync._id;
-    matchingTask.group.assignedDate = new Date();
+    if (assigningUser) {
+      matchingTask.group.assignedDate = new Date();
+    } else {
+      matchingTask.group.claimedDate = new Date();
+    }
     user.tasksOrder[`${taskToSync.type}s`].unshift(matchingTask._id);
   } else {
     _.merge(matchingTask, syncableAttrs(taskToSync));
@@ -1554,6 +1571,7 @@ schema.methods.syncTask = async function groupSyncTask (taskToSync, user, assign
 
   matchingTask.group.approval.required = taskToSync.group.approval.required;
   matchingTask.group.assignedUsers = taskToSync.group.assignedUsers;
+  matchingTask.group.claimedUser = taskToSync.group.claimedUser;
   matchingTask.group.sharedCompletion = taskToSync.group.sharedCompletion;
   matchingTask.group.managerNotes = taskToSync.group.managerNotes;
   if (assigningUser && user._id !== assigningUser._id) {
@@ -1575,13 +1593,19 @@ schema.methods.syncTask = async function groupSyncTask (taskToSync, user, assign
   // add tag if missing
   if (matchingTask.tags.indexOf(group._id) === -1) matchingTask.tags.push(group._id);
 
+  // set up Daily repeat schedule
+  if (matchingTask.type === 'daily') setNextDue(matchingTask, user);
+
   toSave.push(matchingTask.save(), taskToSync.save(), user.save());
   return Promise.all(toSave);
 };
 
 schema.methods.unlinkTask = async function groupUnlinkTask (
-  unlinkingTask, user,
-  keep, saveUser = true,
+  unlinkingTask,
+  user,
+  keep,
+  saveUser = true,
+  saveTask = true,
 ) {
   const findQuery = {
     'group.taskId': unlinkingTask._id,
@@ -1589,7 +1613,13 @@ schema.methods.unlinkTask = async function groupUnlinkTask (
   };
 
   const assignedUserIndex = unlinkingTask.group.assignedUsers.indexOf(user._id);
-  unlinkingTask.group.assignedUsers.splice(assignedUserIndex, 1);
+  if (assignedUserIndex !== -1) {
+    unlinkingTask.group.assignedUsers.splice(assignedUserIndex, 1);
+  } else if (unlinkingTask.group.claimedUser === user._id) {
+    unlinkingTask.group.claimedUser = '';
+  } else {
+    throw new BadRequest('Cannot unassign user who is not assigned.');
+  }
 
   if (keep === 'keep-all') {
     await Tasks.Task.update(findQuery, {
@@ -1607,7 +1637,8 @@ schema.methods.unlinkTask = async function groupUnlinkTask (
       user.markModified('tasksOrder');
     }
 
-    const promises = [unlinkingTask.save()];
+    const promises = [];
+    if (saveTask) promises.push(unlinkingTask.save());
     if (task) {
       promises.push(task.remove());
     }

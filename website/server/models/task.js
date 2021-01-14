@@ -129,24 +129,27 @@ export const TaskSchema = new Schema({
   group: {
     id: { $type: String, ref: 'Group', validate: [v => validator.isUUID(v), 'Invalid uuid for group task.'] },
     broken: { $type: String, enum: ['GROUP_DELETED', 'TASK_DELETED', 'UNSUBSCRIBED'] },
-    assignedUsers: [{ $type: String, ref: 'User', validate: [v => validator.isUUID(v), 'Invalid uuid for group assigned user.'] }],
+    assignedUsers: [{ $type: String, ref: 'User', validate: [v => validator.isUUID(v), 'Invalid uuid for team assigned user.'] }],
     assignedDate: { $type: Date },
     assigningUsername: { $type: String },
-    taskId: { $type: String, ref: 'Task', validate: [v => validator.isUUID(v), 'Invalid uuid for group task.'] },
+    taskId: { $type: String, ref: 'Task', validate: [v => validator.isUUID(v), 'Invalid uuid for team task.'] },
     approval: {
-      required: { $type: Boolean, default: false },
-      approved: { $type: Boolean, default: false },
+      required: { $type: Boolean },
+      approved: { $type: Boolean },
       dateApproved: { $type: Date },
-      approvingUser: { $type: String, ref: 'User', validate: [v => validator.isUUID(v), 'Invalid uuid for group approving user.'] },
-      requested: { $type: Boolean, default: false },
+      approvingUser: { $type: String, ref: 'User', validate: [v => validator.isUUID(v), 'Invalid uuid for team approving user.'] },
+      requested: { $type: Boolean },
       requestedDate: { $type: Date },
+      requestingUsers: [{ $type: String, ref: 'User', validate: [v => validator.isUUID(v), 'Invalid uuid for team user requesting approval.'] }],
     },
     sharedCompletion: {
       $type: String,
       enum: _.values(SHARED_COMPLETION),
-      default: SHARED_COMPLETION.single,
     },
     managerNotes: { $type: String },
+    claimable: { $type: Boolean },
+    claimedDate: { $type: Date },
+    claimedUser: { $type: String },
   },
 
   reminders: [reminderSchema],
@@ -216,7 +219,7 @@ TaskSchema.statics.findMultipleByIdOrAlias = async function findByIdOrAlias (
   if (!userId) throw new Error('User identifier is a required argument');
 
   const query = _.cloneDeep(additionalQueries);
-  query.userId = userId;
+  // query.userId = userId;
 
   const ids = [];
   const aliases = [];
@@ -229,10 +232,18 @@ TaskSchema.statics.findMultipleByIdOrAlias = async function findByIdOrAlias (
     }
   });
 
-  query.$or = [
-    { _id: { $in: ids } },
-    { alias: { $in: aliases } },
-  ];
+  if (ids.length > 0 && aliases.length > 0) {
+    query.$or = [
+      { _id: { $in: ids } },
+      { alias: { $in: aliases } },
+    ];
+  } else if (ids.length > 0) {
+    query._id = { $in: ids };
+  } else if (aliases.length > 0) {
+    query.alias = { $in: aliases };
+  } else {
+    throw new Error('No identifiers found.'); // Should be covered by the !identifiers check, but..
+  }
 
   const tasks = await this.find(query).exec();
 

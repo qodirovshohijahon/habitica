@@ -8,6 +8,7 @@ import { removeFromArray } from '../../libs/collectionManipulators';
 import * as Tasks from '../../models/task';
 import { model as Challenge } from '../../models/challenge';
 import { model as Group } from '../../models/group';
+import { model as User } from '../../models/user';
 import {
   NotFound,
   NotAuthorized,
@@ -662,14 +663,13 @@ api.updateTask = {
 
     _.assign(task, sanitizedObj);
 
-    // console.log(task.modifiedPaths(), task.toObject().repeat === tep)
-    // repeat is always among modifiedPaths because mongoose changes
-    // the other of the keys when using .toObject()
-    // see https://github.com/Automattic/mongoose/issues/2749
-
     task.group.approval.required = false;
     if (sanitizedObj.requiresApproval) {
       task.group.approval.required = true;
+    }
+    task.group.claimable = false;
+    if (sanitizedObj.claimable) {
+      task.group.claimable = true;
     }
     if (sanitizedObj.sharedCompletion) {
       task.group.sharedCompletion = sanitizedObj.sharedCompletion;
@@ -704,17 +704,27 @@ api.updateTask = {
     }
 
     setNextDue(task, user);
-    const savedTask = await task.save();
 
-    if (group && task.group.id && task.group.assignedUsers.length > 0) {
+    if (group && task.group.id
+      && (task.group.assignedUsers.length > 0 || task.group.claimedUser)
+    ) {
       const updateCheckListItems = _.remove(sanitizedObj.checklist, checklist => {
         const indexOld = _.findIndex(oldCheckList, check => check.id === checklist.id);
         if (indexOld !== -1) return checklist.text !== oldCheckList[indexOld].text;
         return false; // Only return changes. Adding and remove are handled differently
       });
 
-      await group.updateTask(savedTask, { updateCheckListItems });
+      await group.updateTask(task, { updateCheckListItems });
+
+      if (task.group.claimable && task.group.assignedUsers.length > 0) {
+        const assignedUsers = await User.find({ _id: { $in: task.group.assignedUsers } }, '_id tasksOrder').exec();
+        await Promise.all(assignedUsers.map(assignedUser => group.unlinkTask(
+          task, assignedUser, null, null, false,
+        )));
+        task.group.assignedUsers = [];
+      }
     }
+    const savedTask = await task.save();
 
     res.respond(200, savedTask);
 
